@@ -24,13 +24,7 @@ import argparse
 import logging
 import sys
 import os
-import re
-import ipaddress
-import socket
 import time
-from datetime import datetime
-import os
-import csv
 
 import apache_beam as beam
 from apache_beam.metrics.metric import Metrics
@@ -38,10 +32,12 @@ from apache_beam.transforms.core import Windowing
 from apache_beam.transforms.window import FixedWindows
 from apache_beam.transforms.trigger import AfterProcessingTime
 from apache_beam.transforms.trigger import AccumulationMode
+from apache_beam.transforms.trigger import AfterWatermark
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import SetupOptions
 from apache_beam.options.pipeline_options import StandardOptions
 from apache_beam.options.pipeline_options import GoogleCloudOptions
+from google.cloud import pubsub
 
 TIME_FORMAT = '%m/%d/%Y %H:%M:%S.%f %p'
 PROJECT = 'elen-e6889'
@@ -51,18 +47,7 @@ SUBSCRIPTION = 'util-sub'
 DFLOW_TEMP = 'gs://e6889-bucket/tmp/'
 STAGE = 'gs://e6889-bucket/stage/'
 TARGET_UTILITY = 'DP2_WholeHouse_Power_Val'
-
-# NOTE: str2timestamp() & timestamp2str() are available in the Apache Beam
-# example "hourly_team_score.py"
-def str2timestamp(s, fmt=TIME_FORMAT):
-  """Converts a string into a unix timestamp."""
-  dt = datetime.strptime(s, fmt)
-  epoch = datetime.utcfromtimestamp(0)
-  return (dt - epoch).total_seconds()
-
-def timestamp2str(t, fmt=TIME_FORMAT):
-  """Converts a unix timestamp into a formatted string."""
-  return datetime.fromtimestamp(t).strftime(fmt)
+RUNNER = 'DataflowRunner'
 
 ######################################################
 # CUSTOM PTRANSFORMS
@@ -100,7 +85,7 @@ class ExtractAndAverageTarget(beam.PTransform):
 ######################################################
 # PIPELINE
 ######################################################
-def run():
+def run(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--project', '-p',
                         dest='project',
@@ -137,7 +122,11 @@ def run():
                         default=TARGET_UTILITY,
                         help='Target utility to be averaged. Default: ' \
                               '\'DP2_WholeHouse_Power_Val\'')
-
+    parser.add_argument('--runner', '-r',
+                        dest='runner',
+                        default=RUNNER,
+                        help='Target utility to be averaged. Default: ' \
+                              '\'DP2_WholeHouse_Power_Val\'')
     args = parser.parse_args()
     project = args.project
     topic_in = args.topic_in
@@ -145,50 +134,82 @@ def run():
     dflow_temp = args.dflow_temp
     stage = args.stage
     target = args.target
+    runner = args.runner
 
+    # static
+    sub_in = 'util-sub-sim'
+    sub_out = 'util-sub-out'
+
+   
     # Start Beam Pipeline
     pipeline_options = PipelineOptions()
-    # pipeline_options.view_as(SetupOptions).save_main_session = True
-    #pipeline_options.view_as(StandardOptions).streaming = True
-    #pipeline_options.view_as(StandardOptions).runner = 'DataflowRunner'
-    #pipeline_options.view_as(GoogleCloudOptions).project = project
-    #pipeline_options.view_as(GoogleCloudOptions).temp_location = dflow_temp
-    #pipeline_options.view_as(GoogleCloudOptions).staging_location = stage
-    p = beam.Pipeline(options=pipeline_options)
-    #p = beam.Pipeline(options=PipelineOptions())
-    # No runner specified -> DirectRunner used (local runner)
+    pipeline_options.view_as(SetupOptions).requirements_file = 'requirements.txt'
+    pipeline_options.view_as(SetupOptions).save_main_session = True # global session to workers
+    pipeline_options.view_as(StandardOptions).runner = str(runner)
+    if runner == 'DataflowRunner':
+      pipeline_options.view_as(StandardOptions).streaming = True
+      pipeline_options.view_as(GoogleCloudOptions).project = project
+      pipeline_options.view_as(GoogleCloudOptions).temp_location = dflow_temp
+      pipeline_options.view_as(GoogleCloudOptions).staging_location = stage
+      
+      # pubsub Config
+      subscriber = pubsub.SubscriberClient()
+      # topics and subscriptions
+      topic_in_path = 'projects/{:s}/topics/{:s}'.format(project,topic_in)
+      sub_in_path = 'projects/{:s}/subscriptions/{:s}'.format(project,sub_in)
+      try:
+        subscriber.create_subscription(
+              name=sub_in_path, topic=topic_in_path)
+      except:
+          print("Subscription \'{}\' already exists\n!".format(sub_in_path))
+      
+      # pub/sub output topics and subscriptions
+      topic_out_path = 'projects/{:s}/topics/{:s}'.format(project,topic_out)
+      sub_out_path = 'projects/{:s}/subscriptions/{:s}'.format(project,sub_out)
+      try:
+        subscriber.create_subscription(
+              name=sub_out_path, topic=topic_out_path)
+      except:
+          print("Subscription \'{}\' already exists\n!".format(sub_out_path))
 
     # Define pipline
-    row = (p | 'ReadData' >> beam.io.ReadFromText('Export_SPL_House2_050216_Data_test.csv'))
-#    ip_size_pcoll = (p | 'GetData' >>  beam.io.ReadFromPubSub(
-#                                    topic='projects/{s}/topic/{s}'
-#                                            .format(project,topic_in))
-#                                    .with_output_types(bytes)
+    p = beam.Pipeline(options=pipeline_options)
+
+    if runner == 'Direct':  
+      row = (p | 'ReadData' >> beam.io.ReadFromText('Export_SPL_House2_050216_Data.csv'))  
+    #row = (p | 'ReadData' >> beam.io.ReadFromText('gs://e6889-bucket/data/Export_SPL_House2_050216_Data_test.csv'))
+    else:  
+      row = (p | 'GetData' >>  beam.io.ReadFromPubSub(  
+                                   #topic=topic_in_path,
+                                   subscription=sub_in_path)
+                                   .with_output_types(bytes))
 
     pane = (row | 'ParseData' >> beam.ParDo(ParseDataFn())
                 | 'ParseTimestamp' >> beam.ParDo(ParseTimestampFn()) # Optimization 1: merge with ParseData
-#                | 'AddTimestamp' >> beam.ParDo(AddTimestampFn()))
-                | 'AddTimestsamp' >> beam.Map(lambda elem: beam.window.TimestampedValue(elem,elem.pop('Timestamp',None)))
-                | 'Window' >> beam.WindowInto(FixedWindows(10,0)))#, #size=10,offset=0
-#                                trigger=AfterProcessingTime(30),
-#                                accumulation_mode=AccumulationMode.DISCARDING)) # add a trigger to account for late data up to 30 seconds
+                | 'AddTimestamp' >> beam.ParDo(AddTimestampFn())
+                # | 'AddTimestsamp' >> beam.Map(lambda elem: beam.window.TimestampedValue(elem,elem.pop('Timestamp',None)))
+                | 'Window' >> beam.WindowInto(FixedWindows(10 ,0), #size=10,offset=0
+                                trigger=AfterWatermark(
+                                            late=AfterProcessingTime(30)), # allow for late data up to 30 seconds after window
+                                accumulation_mode=AccumulationMode.DISCARDING))
 
 #                    | 'CombineAsList' >> beam.CombineGlobally(
 #                                              beam.combiners.ToListCombineFn()).without_defaults()
     output = (pane  #| 'FilterTarget' >> beam.Map(lambda x: (target,x[target])) #Optimization 2: filter in ParseData
 #                    | 'TargetAvg' >> beam.CombinePerKey(beam.combiners.MeanCombineFn()) # average value per window pane
                     | 'TargetAvg' >> ExtractAndAverageTarget(target)
-                    | 'FormatOutput' >> beam.ParDo(FormatOutputFn())
-#                   | 'Encode' >> beam.Map(lambda x: x.encode('utf-8'))
-#                                                .with_output_types(bytes)
-#                   | beam.io.WriteToText('gs://e6889-bucket/results/hw2/output.csv'))
-                    | beam.io.WriteToText('output.csv'))
+                    #| 'TargetFilter' >> beam.Map(lambda elem: (target, elem[target]))
+                    #| 'TargetAvg' >> beam.CombinePerKey(beam.combiners.MeanCombineFn())
+                    | 'FormatOutput' >> beam.ParDo(FormatOutputFn()))
 
-    # Write to output file as text   
-    # pylint: disable=expression-not-assigned  
-    #ip_size_pcoll | beam.io.WriteToPubSub('projects/{s}/topic/{s}'
-    #                                        .format(project,topic_out))
-    #ip_size_pcoll | beam.io.WriteToText('gs://e6889-bucket/results/hw2/output.csv')
+    if runner == 'Direct':
+      output | beam.io.WriteToText('output.csv')
+    else:
+      #output | beam.io.WriteToText('gs://e6889-bucket/results/hw2/output.csv')
+      output | beam.io.WriteToPubSub( 
+                   topic=topic_out_path)#,
+                   #subscription=sub_out_path)
+
 
     # Execute the Pipline
     result = p.run()
@@ -230,9 +251,11 @@ class ParseDataFn(beam.DoFn):
   def process(self,element):
     # assume CSV as data input format
     try:
-      elements = list(csv.reader([element]))[0]
-      values = [float(i) for i in elements[1:-1:2]] #r emove unit and test columns
+      #elements = list(csv.reader([element]))[0]
+      elements = element.split(',')
+      values = [float(i) for i in elements[1:-1:2]] #remove unit and test columns
       values.append(elements[0]) # add timestamp to the end
+      logging.info('Parsed values: \'%s\'', values)
       # Optimization 1: "merge"      
       yield dict(zip(self.keys,values)) # save as dictionary
       #yield zip(self.keys,values) # list of tuples((a,1),(b,2),(c,3))
@@ -241,37 +264,15 @@ class ParseDataFn(beam.DoFn):
       self.num_parse_errors.inc()
       logging.error('Parse error on \'%s\'', element)
     
-    # parse timestamp (first element)
-    # try:
-    #   dt_obj = datetime.strptime(elements[0], TIME_FORMAT) 
-    #   unix_ts = time.mktime(dt_obj.timetuple())
-
-    #   logging.debug('ParseDataFn(): Date-time = %s', elements[0])    
-    #   logging.debug('ParseDataFn(): Timestamp = %s', unix_ts)
-
-    #   # after timestamp, remove "unit" columns (every other column > 1)
-    #   elements = elements[1::2]
-
-    #   # convert element list to dictionary with known keys
-    #   # NOTE: assumes data integrity, else returns empty dictionary 
-    #   try:
-    #     element_dict = dict(zip(self.keys,elements))
-    #   except:
-    #     element_dict = (dict(zip(self.keys,[0]*len(self.keys))))
-
-    #   return [(element_dict,unix_ts)] 
-
-    # except:
-    #   logging.info('ParseDataFn(): Failed to get timestamp from \'%s\'', elements[0])
-    #   return ret_err  
-
 class ParseTimestampFn(beam.DoFn):
   def process(self, element):
-      logging.info('ConvertTimestampFn(): Timestamp {}\n'.format(element["Timestamp"]))
-      dt_obj = datetime.strptime(element["Timestamp"], TIME_FORMAT) 
-      unix_ts = time.mktime(dt_obj.timetuple())
-      element["Timestamp"] = float(unix_ts)
-      yield element
+    from datetime import datetime 
+
+    logging.info('ConvertTimestampFn(): Timestamp {}\n'.format(element["Timestamp"]))
+    dt_obj = datetime.strptime(element["Timestamp"], TIME_FORMAT) 
+    unix_ts = time.mktime(dt_obj.timetuple())
+    element["Timestamp"] = float(unix_ts)
+    yield element
 
 # ParDo Transform: adds timestamp to element
 # Ref: Beam Programming Guide
@@ -290,17 +291,12 @@ class FormatOutputFn(beam.DoFn):
     
     start = window.start.to_utc_datetime().strftime(TIME_FORMAT)
     end = window.end.to_utc_datetime().strftime(TIME_FORMAT)
-    formatApply = "Average power for {:s} was {:f} during the period of " \
-                    "{:s} to {:s}"
+    # Format as CSV: "AVG(target),average_power,start of period,end of period"
+    formatApply = "AVG({:s}), {:f}, {:s}, {:s}"
     formattedOutput = formatApply.format(rawOutput[0],rawOutput[1],start,end)# Transform: format the output as 'IP : size'
-    #formatApply = "{:7d} byte(s) were served to {:s}"
-    # loop through (presumably) sorted list
-    #formattedOutput = []
-    #for rawOutput in rawOutputs:
-    #  formattedOutput.append(formatApply.format(rawOutput[1],rawOutput[0]))
-    
+   
     logging.info('FormatOutputFn() {}\n'.format(formattedOutput))
-    return formattedOutput
+    return [formattedOutput]
 
 # END CUSTOM PARDO FUNCTIONS
 ######################################################

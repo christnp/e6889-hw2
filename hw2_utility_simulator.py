@@ -55,7 +55,8 @@ from google.cloud import pubsub
 TIME_FORMAT = '%m/%d/%Y %H:%M:%S.%f %p'
 PROJECT = 'elen-e6889'
 TOPIC_OUT = 'util-simulator'
-INPUT = 'Export_SPL_House2_050216_Data_test.csv.gz'
+#INPUT = 'Export_SPL_House2_050216_Data_test.csv.gz'
+INPUT = 'Export_SPL_House2_050216_Data.csv.gz'
 
 def publish(publisher, topic, events):
    numobs = len(events)

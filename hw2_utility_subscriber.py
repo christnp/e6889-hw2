@@ -34,8 +34,8 @@ from google.cloud import pubsub
 # constants
 TIME_FORMAT = '%m/%d/%Y %H:%M:%S.%f %p'
 PROJECT = 'elen-e6889'
-TOPIC_IN = 'util-simulator'
-SUBSCRIPTION = 'util-sub'
+TOPIC_IN = 'util-output'
+SUBSCRIPTION = 'util-sub-out'
 OUTPUT = 'Output.txt'
 
 def run():
@@ -84,12 +84,16 @@ def run():
         project_id=project,
         sub=subscription,
     )
-    subscriber.create_subscription(
-        name=subscription_name, topic=topic_name)
+
+    try:
+        subscriber.create_subscription(
+            name=subscription_name, topic=topic_name)
+    except:
+        print("Subscription \'{}\' already exists\n!".format(subscription_name))
 
     def callback(message):
         current = message.data
-        print(current)
+        print('Received message: {}'.format(message))
         # write line to csv
         # if csv is X bytes, close it and create new
         previous = current
@@ -97,6 +101,16 @@ def run():
 
     future = subscriber.subscribe(subscription_name, callback)
 
+    #Blocks the thread while messages are coming in through the stream. Any
+    # exceptions that crop up on the thread will be set on the future.
+    try:
+        # When timeout is unspecified, the result method waits indefinitely.
+        future.result(timeout=30)
+    except Exception as e:
+        print(
+            'Listening for messages on {} threw an Exception: {}.'.format(
+                subscription_name, e))  
+    
 
 if __name__ == '__main__':
     # create Pub/Sub notification topic
