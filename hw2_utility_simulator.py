@@ -45,6 +45,7 @@ import re
 import ipaddress
 import socket
 from datetime import datetime
+from collections import defaultdict
 #import datetime
 import time
 import gzip
@@ -53,7 +54,6 @@ from google.cloud import pubsub
 TIME_FORMAT = '%m/%d/%Y %H:%M:%S.%f %p'
 PROJECT = 'elen-e6889'
 TOPIC_OUT = 'util-simulator'
-#INPUT = 'Export_SPL_House2_050216_Data_test.csv.gz'
 INPUT = 'Export_SPL_House2_050216_Data.csv.gz'
 SAMP_RATE = 1
 
@@ -72,44 +72,19 @@ def get_timestamp(line):
     timestamp = line.split(',')[0]
     return datetime.strptime(timestamp, TIME_FORMAT)
 
-def put_timestamp(line,hdr):
-    ## convert from bytes to str
-    line = line.decode('utf-8')
-    hdr = hdr.decode('utf-8')
-
-    # split header and line CSVs into list
-    hdr_line = hdr.split(',')
-    mod_line = line.split(',')
-    
-    # assume timestamp is at first field of row
-    # mod_line[0] = time.time()
-    new_line = zip(hdr_line,mod_line)
-    # the_line = [list(tup)+[time.time()] for tup in new_line]
-    
-    # print([time.time()]*len(mod_line))
-    # sys.exit()
-    logging.info('put_timestamp: {}'.format(new_line))
-
-    new_line = ','.join(map(str, mod_line))
-    return new_line
-
-
 def simulate(topic, ifp, header, firstObsTime, programStart, sampRate):
-    # sleep computation
-    # def compute_sleep_secs(obs_time):
-    #     time_elapsed = (datetime.utcnow() - programStart).seconds
-    #     sim_time_elapsed = (obs_time - firstObsTime).seconds / sampRate
-    #     to_sleep_secs = sim_time_elapsed - time_elapsed
-    #     return to_sleep_secs
 
     topublish = list() 
     to_sleep_secs = 1/sampRate
 
     header = header.split(',')
     ema = [0]*len(header)
+    ema_dict = defaultdict(list)
+    avg_dict = defaultdict(list)
     #N = # of time periods or size of windows
     N = 4 # Window is 1 minute
     alpha = .9#2/float(1+N)
+    
     #with open('truth_data.csv', 'w') as testData:
     with open('test_data.csv', 'w') as testData,open('ema_truth_data.csv','w') as truthData:
         test_csv = csv.writer(testData)
@@ -126,37 +101,34 @@ def simulate(topic, ifp, header, firstObsTime, programStart, sampRate):
             for idx,data in enumerate(line):
                 # we only want to pass floating point data, no strings (i.e., "W")
                 tmp_header,x,y = (header[idx].lstrip()).partition(' ')
+                # try:
                 try:
                     float(data)
+                    print("Wjat")
+               
                     #data_out.append((tmp_header,data,time.time()))
                     data_out = [(tmp_header,data,time.time())]
 
                     # truth data, moving average
-                    ema[count] = float(data)*alpha + ema[count-1]*(1-alpha)
-                    
+                    #ema = float(data)*alpha + ema[count-1]*(1-alpha)
+
+                    # keep track of truth data for comparison
+                    avg_dict[tmp_header].append(data)
+                    ema_dict[tmp_header].append(ema)
+        
                     # Writes to output_data.csv file for DirectRunner 
                     test_csv.writerows(data_out)
 
                     # publish the data
-                    logging.debug("data out: {} \n".format(data_out))
+                    logging.info("data out: {} \n".format(data_out))
                     #publish(publisher, topic, data_out)
 
-                    logging.info("Publishing... {} {}".format(count,data_out[count]))
+                    #logging.info("Publishing... {} {}".format(count,data_out[count]))
                     count += 1
                     time.sleep(sleep_time) # simluate realistic sample times
 
                 except:
-                    logging.info("Failed: data = {} \n".format(data_out))
-
-                    pass
-                publish(publisher, topic, data_out)
-                
-            # keep track of moving average
-            logging.debug("exponential moving average: \n {}".format(ema))
-            ema.insert(0,datetime.now().strftime("%H:%M:%S"))
-            truth_csv.writerows([ema])
-
-            logging.info('\n[{}] Sent full data sample\n'.format(datetime.now().strftime("%H:%M:%S")))
+                    continue
 
     # left-over records; notify again
     publish(publisher, topic, data_out)
@@ -205,16 +177,8 @@ def run():
     topic_out = args.topic_out
     samp_rate = float(args.samp_rate)
 
-    # # create Pub/Sub notification topic
-    # logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
-    # publisher = pubsub.PublisherClient()
+
     event_type = publisher.topic_path(project,topic_out)
-    # try:
-    #     publisher.get_topic(event_type)
-    #     logging.info('Reusing pub/sub topic {}'.format(topic_out))
-    # except:
-    #     publisher.create_topic(event_type)
-    #     logging.info('Creating pub/sub topic {}'.format(topic_out))
 
     # notify about each line in the input file
     programStartTime = datetime.utcnow() 

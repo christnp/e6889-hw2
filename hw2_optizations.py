@@ -49,39 +49,6 @@ STAGE = 'gs://e6889-bucket/stage/'
 TARGET_UTILITY = 'DP2_WholeHouse_Power_Val'
 RUNNER = 'DataflowRunner'
 
-######################################################
-# CUSTOM PTRANSFORMS
-######################################################
-# PTransform: Extracts the target value and averages (eper window)
-class ExtractAndAverageTarget(beam.PTransform):
-  """A transform to extract key/power information and average the power.
-  The constructor argument `target` determines what target info is
-  extracted. The 
-
-  Reference: Apache Beam hourly_team_score.py example
-  """
-  def __init__(self, target,optimized):
-    super(ExtractAndAverageTarget, self).__init__()
-    self.target = target
-    self.optimized = optimized
-
-  def expand(self, pcoll):
-
-    logging.info('ExtractAndAverageTarget(): averaging {} \n'.format(self.target)) 
-    if self.optimized:
-      # Reordering optimizaiton applied
-      output = (pcoll | beam.Filter(lambda x: x[0] == self.target)
-                      | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
-    else:
-      output = (pcoll | beam.CombinePerKey(beam.combiners.MeanCombineFn())
-                      | beam.Filter(lambda x: x[0] == self.target))                    
-
-    return output
-            
-
-# END CUSTOM PTRANSFORMS
-######################################################
-
 
 ######################################################
 # PIPELINE
@@ -146,10 +113,11 @@ def run(argv=None):
     # static
     sub_in = 'util-sub-sim'
     sub_out = 'util-sub-out'
-
    
     # Start Beam Pipeline
     pipeline_options = PipelineOptions()
+    # use the requirements document to list Python packages required in the pipeline
+    # NOTE: this didn't seem to resolve the datetime dependecy I saw
     #pipeline_options.view_as(SetupOptions).requirements_file = 'requirements.txt'
     pipeline_options.view_as(SetupOptions).save_main_session = True # global session to workers
     pipeline_options.view_as(StandardOptions).runner = str(runner)
@@ -192,22 +160,14 @@ def run(argv=None):
                                    .with_output_types(bytes))
 
     pane = (row | 'ParseData' >> beam.ParDo(ParseDataFn())
-                | 'AddTimestamp' >> beam.ParDo(AddTimestampFn()))
-                # | 'AddTimestsamp' >> beam.Map(lambda elem: beam.window.TimestampedValue(elem,elem.pop('Timestamp',None)))
-                #| 'Window' >> beam.WindowInto(FixedWindows(2 ,0)))#, #size=10,offset=0
+                | 'AddTimestamp' >> beam.ParDo(AddTimestampFn())
+                | 'Window' >> beam.WindowInto(FixedWindows(2 ,0)))#, #size=10,offset=0
                                 # trigger=AfterWatermark(
                                 #             late=AfterProcessingTime(30)), # allow for late data up to 30 seconds after window
                                 # accumulation_mode=AccumulationMode.DISCARDING))
 
-    def filterTarget(element, target):
-      logging.info(" Element: {}\n Target: {}".format(element[0],target))
-      logging.info("Equal? {}".format(element[0]==target))
-
-
-      return element  
+  
     output = (pane  | 'TargetAvg' >> ExtractAndAverageTarget(target,optimized)
-                    #| beam.CombinePerKey(beam.combiners.MeanCombineFn())
-                    #| beam.Filter(lambda x: x[0]==target)
                     | 'FormatOutput' >> beam.ParDo(FormatOutputFn()))
 
     if runner == 'Direct':
@@ -224,6 +184,39 @@ def run(argv=None):
     result.wait_until_finish()
 
 # END PIPELINE
+######################################################
+
+######################################################
+# CUSTOM PTRANSFORMS
+######################################################
+# PTransform: Extracts the target value and averages (eper window)
+class ExtractAndAverageTarget(beam.PTransform):
+  """A transform to extract key/power information and average the power.
+  The constructor argument `target` determines what target info is
+  extracted. The 
+
+  Reference: Apache Beam hourly_team_score.py example
+  """
+  def __init__(self, target,optimized):
+    super(ExtractAndAverageTarget, self).__init__()
+    self.target = target
+    self.optimized = optimized
+
+  def expand(self, pcoll):
+
+    logging.info('ExtractAndAverageTarget(): averaging {} \n'.format(self.target)) 
+    if self.optimized:
+      # Reordering optimizaiton applied
+      output = (pcoll | beam.Filter(lambda x: x[0] == self.target)
+                      | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+    else:
+      output = (pcoll | beam.CombinePerKey(beam.combiners.MeanCombineFn())
+                      | beam.Filter(lambda x: x[0] == self.target))                    
+
+    return output
+            
+
+# END CUSTOM PTRANSFORMS
 ######################################################
 
 
@@ -248,7 +241,7 @@ class ParseDataFn(beam.DoFn):
   def process(self,element):
     element.encode('utf-8')
     elements = element.split(',')
-    # assume CSV as data input format    
+    # assume CSV as data input format; split the data and cast appropriately
     key = elements[0]
     try:
       value = float(elements[1])
@@ -258,7 +251,7 @@ class ParseDataFn(beam.DoFn):
 
       logging.critical("ParseDataFn(): value parse error for \'{}\'".format(key))
     try:
-      unix_ts = float(elements[2]) #element.pop('Timestamp',None) 
+      unix_ts = float(elements[2])
     except:
       unix_ts = 0
       self.num_parse_errors.inc()
@@ -267,14 +260,12 @@ class ParseDataFn(beam.DoFn):
     logging.debug("ParseDataFn(): ({},{},{})".format(key,value,unix_ts))
 
     # new_element = dict((key,value))
-      #yield zip(self.keys,values) # list of tuples((a,1),(b,2),(c,3))
     yield [key,value,unix_ts]
     
 # ParDo Transform: adds timestamp to element
 # Ref: Beam Programming Guide
 class AddTimestampFn(beam.DoFn):
   def process(self, element):
-    # pop the timestamp off the dictionary (NOTE: this removes it from element)
     # PCollecton format: [key,value,unix_ts]
     key_value = (element[0],element[1])
     unix_ts = element[2]
