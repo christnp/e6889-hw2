@@ -179,7 +179,7 @@ def run():
                         default=TEST_CSV,
                         help='Number of simulated samples per second. This is ' \
                             'how fast the data will be read per line ' \
-                            '(lines/sec). Default: \'{}\''.format(SAMP_RATE))                    
+                            '(lines/sec). Default: \'{}\''.format(TEST_CSV))                    
 
     args = parser.parse_args()
     sim_in = args.input
