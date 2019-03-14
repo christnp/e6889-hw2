@@ -55,12 +55,13 @@ TIME_FORMAT = '%m/%d/%Y %H:%M:%S.%f %p'
 PROJECT = 'elen-e6889'
 TOPIC_OUT = 'util-simulator'
 INPUT = 'Export_SPL_House2_050216_Data.csv.gz'
-SAMP_RATE = 1
+SAMP_RATE = 0.5
+TEST_CSV = 'test_data.csv'
 
-def publish(publisher, topic, events):
+def publish(publisher, topic, events, title):
     numobs = len(events)
     if numobs > 0:
-        logging.info('Publishing {0} events from {1}'.format(numobs, events[0]))
+        logging.info('{0} - Publishing {1} batch events from {2}'.format(datetime.now().strftime("%H:%M:%S"),numobs,title))
         for event_data in events:
             publisher.publish(topic,event_data)
 
@@ -72,21 +73,25 @@ def get_timestamp(line):
     timestamp = line.split(',')[0]
     return datetime.strptime(timestamp, TIME_FORMAT)
 
-def simulate(topic, ifp, header, firstObsTime, programStart, sampRate):
+def simulate(topic, ifp, header, firstObsTime, programStart, sampRate,testCsvLoc):
 
-    topublish = list() 
+    logging.info("Publishing data to topic <{}>".format(str(topic)))
+    logging.info("Saving Driect runner test data as <{}>".format(str(testCsvLoc)))
+    data_out = list() 
     to_sleep_secs = 1/sampRate
 
+    # header from the CSV file; used as the key in the data_out; doesn't change
     header = header.split(',')
-    ema = [0]*len(header)
-    ema_dict = defaultdict(list)
     avg_dict = defaultdict(list)
-    #N = # of time periods or size of windows
+    # TODO: for if/when load shedding is implemented
+    # ema = [0]*len(header)
+    # ema_dict = defaultdict(list)
+   
+    # EMA parameters
     N = 4 # Window is 1 minute
     alpha = .9#2/float(1+N)
     
-    #with open('truth_data.csv', 'w') as testData:
-    with open('test_data.csv', 'w') as testData,open('ema_truth_data.csv','w') as truthData:
+    with open(testCsvLoc, 'w') as testData,open('ema_truth_data.csv','w') as truthData:
         test_csv = csv.writer(testData)
         truth_csv = csv.writer(truthData)
         
@@ -102,36 +107,36 @@ def simulate(topic, ifp, header, firstObsTime, programStart, sampRate):
                 # we only want to pass floating point data, no strings (i.e., "W")
                 tmp_header,x,y = (header[idx].lstrip()).partition(' ')
                 # try:
+                if idx == 0:
+                    dt_native = data
                 try:
                     float(data)
-                    print("Wjat")
-               
-                    #data_out.append((tmp_header,data,time.time()))
-                    data_out = [(tmp_header,data,time.time())]
-
-                    # truth data, moving average
-                    #ema = float(data)*alpha + ema[count-1]*(1-alpha)
+                    data_out.append(str([tmp_header,data,time.time()]).encode('utf-8'))
 
                     # keep track of truth data for comparison
                     avg_dict[tmp_header].append(data)
-                    ema_dict[tmp_header].append(ema)
+
+                    # truth data, moving average
+                    # TODO: truth data for comparison of Load Shedding 
+                    #ema = float(data)*alpha + ema[count-1]*(1-alpha)
+                    # ema_dict[tmp_header].append(ema)
         
                     # Writes to output_data.csv file for DirectRunner 
                     test_csv.writerows(data_out)
-
-                    # publish the data
-                    logging.info("data out: {} \n".format(data_out))
-                    #publish(publisher, topic, data_out)
-
-                    #logging.info("Publishing... {} {}".format(count,data_out[count]))
-                    count += 1
-                    time.sleep(sleep_time) # simluate realistic sample times
-
                 except:
                     continue
+                count += 1
+                time.sleep(sleep_time) # simluate realistic sample times    
 
+            # publish the data
+            logging.debug("data out: {}".format(data_out))
+            publish(publisher, topic, data_out, dt_native)
+
+            # clear the batch publishing list
+            data_out = list()
+            #logging.info("Publishing... {} {}".format(count,data_out[count]))
+            
     # left-over records; notify again
-    publish(publisher, topic, data_out)
     data_out = list()
     testData.close()
 
@@ -169,13 +174,19 @@ def run():
                         help='Number of simulated samples per second. This is ' \
                             'how fast the data will be read per line ' \
                             '(lines/sec). Default: \'{}\''.format(SAMP_RATE))
-                        
+    parser.add_argument('--csv', '-c',
+                        dest='test_csv',
+                        default=TEST_CSV,
+                        help='Number of simulated samples per second. This is ' \
+                            'how fast the data will be read per line ' \
+                            '(lines/sec). Default: \'{}\''.format(SAMP_RATE))                    
 
     args = parser.parse_args()
     sim_in = args.input
     project = args.project
     topic_out = args.topic_out
     samp_rate = float(args.samp_rate)
+    test_csv_loc = args.test_csv
 
 
     event_type = publisher.topic_path(project,topic_out)
@@ -186,8 +197,9 @@ def run():
         header = ifp.readline()  # grab header
         firstObsTime = peek_timestamp(ifp)
         #firstObsTime = programStartTime + 1
-        logging.info('Sending utility data from {}'.format(firstObsTime))
-        simulate(event_type, ifp, header, firstObsTime, programStartTime, samp_rate)
+        logging.info('Sending utility data from <{}>'.format(sim_in))
+        simulate(event_type, ifp, header, firstObsTime, programStartTime, 
+                    samp_rate, test_csv_loc)
 
 
 if __name__ == '__main__':
