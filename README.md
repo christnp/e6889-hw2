@@ -6,3 +6,4 @@ https://www.hopkinsmedicine.org/healthlibrary/conditions/cardiovascular_diseases
 https://catalog.data.gov/dataset/residential-loads-may-2-2016-fc120
 
 
+Change simulator so it replaces old timestamp with new... or converts timestamp to UNIX

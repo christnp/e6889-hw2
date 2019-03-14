@@ -89,7 +89,7 @@ def run():
         subscriber.create_subscription(
             name=subscription_name, topic=topic_name)
     except:
-        print("Subscription \'{}\' already exists\n!".format(subscription_name))
+        print("Subscription \'{}\' already exists!\n".format(subscription_name))
 
     def callback(message):
         current = message.data

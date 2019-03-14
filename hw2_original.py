@@ -55,28 +55,29 @@ RUNNER = 'DataflowRunner'
 # PTransform: Extracts the target value and averages (eper window)
 class ExtractAndAverageTarget(beam.PTransform):
   """A transform to extract key/power information and average the power.
-  The constructor argument `field` determines what target info is
-  extracted.
+  The constructor argument `target` determines what target info is
+  extracted. The 
 
   Reference: Apache Beam hourly_team_score.py example
   """
-  def __init__(self, field):
+  def __init__(self, target,optimized):
     super(ExtractAndAverageTarget, self).__init__()
-    self.field = field
+    self.target = target
+    self.optimized = optimized
 
   def expand(self, pcoll):
 
-    def tmp(element,target):
-      logging.info('ExtractAndAverageTarget(): {} \n'.format((target,float(element[target])))) 
-      #logging.info('ExtractAndAverageTarget(): {} \n'.format(element.items()))
-      return (target,element[target])
-      #return element.items()
+    logging.info('ExtractAndAverageTarget(): averaging {} \n'.format(self.target)) 
+    if self.optimized:
+      # Reordering optimizaiton applied
+      output = (pcoll | beam.Filter(lambda x: x[0] == self.target)
+                      | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+    else:
+      output = (pcoll | beam.CombinePerKey(beam.combiners.MeanCombineFn())
+                      | beam.Filter(lambda x: x[0] == self.target))                    
 
-
-    return (pcoll
-            #| beam.Map(lambda elem: (self.field, elem[self.field]))
-            | beam.Map(tmp,self.field)
-            | beam.CombinePerKey(beam.combiners.MeanCombineFn()))
+    return output
+            
 
 # END CUSTOM PTRANSFORMS
 ######################################################
@@ -122,6 +123,11 @@ def run(argv=None):
                         default=TARGET_UTILITY,
                         help='Target utility to be averaged. Default: ' \
                               '\'DP2_WholeHouse_Power_Val\'')
+    parser.add_argument('--optimized', '-m',
+                        dest='optimized',
+                        default=False,
+                        help='Run the optimized dataflow (True or False). '\
+                        'Default: \'False\'')
     parser.add_argument('--runner', '-r',
                         dest='runner',
                         default=RUNNER,
@@ -134,6 +140,7 @@ def run(argv=None):
     dflow_temp = args.dflow_temp
     stage = args.stage
     target = args.target
+    optimized = args.optimized
     runner = args.runner
 
     # static
@@ -143,7 +150,7 @@ def run(argv=None):
    
     # Start Beam Pipeline
     pipeline_options = PipelineOptions()
-    pipeline_options.view_as(SetupOptions).requirements_file = 'requirements.txt'
+    #pipeline_options.view_as(SetupOptions).requirements_file = 'requirements.txt'
     pipeline_options.view_as(SetupOptions).save_main_session = True # global session to workers
     pipeline_options.view_as(StandardOptions).runner = str(runner)
     if runner == 'DataflowRunner':
@@ -176,7 +183,7 @@ def run(argv=None):
     p = beam.Pipeline(options=pipeline_options)
 
     if runner == 'Direct':  
-      row = (p | 'ReadData' >> beam.io.ReadFromText('Export_SPL_House2_050216_Data.csv'))  
+      row = (p | 'ReadData' >> beam.io.ReadFromText('test_data.csv'))  
     #row = (p | 'ReadData' >> beam.io.ReadFromText('gs://e6889-bucket/data/Export_SPL_House2_050216_Data_test.csv'))
     else:  
       row = (p | 'GetData' >>  beam.io.ReadFromPubSub(  
@@ -185,21 +192,22 @@ def run(argv=None):
                                    .with_output_types(bytes))
 
     pane = (row | 'ParseData' >> beam.ParDo(ParseDataFn())
-                | 'ParseTimestamp' >> beam.ParDo(ParseTimestampFn()) # Optimization 1: merge with ParseData
-                | 'AddTimestamp' >> beam.ParDo(AddTimestampFn())
+                | 'AddTimestamp' >> beam.ParDo(AddTimestampFn()))
                 # | 'AddTimestsamp' >> beam.Map(lambda elem: beam.window.TimestampedValue(elem,elem.pop('Timestamp',None)))
-                | 'Window' >> beam.WindowInto(FixedWindows(10 ,0), #size=10,offset=0
-                                trigger=AfterWatermark(
-                                            late=AfterProcessingTime(30)), # allow for late data up to 30 seconds after window
-                                accumulation_mode=AccumulationMode.DISCARDING))
+                #| 'Window' >> beam.WindowInto(FixedWindows(2 ,0)))#, #size=10,offset=0
+                                # trigger=AfterWatermark(
+                                #             late=AfterProcessingTime(30)), # allow for late data up to 30 seconds after window
+                                # accumulation_mode=AccumulationMode.DISCARDING))
 
-#                    | 'CombineAsList' >> beam.CombineGlobally(
-#                                              beam.combiners.ToListCombineFn()).without_defaults()
-    output = (pane  #| 'FilterTarget' >> beam.Map(lambda x: (target,x[target])) #Optimization 2: filter in ParseData
-#                    | 'TargetAvg' >> beam.CombinePerKey(beam.combiners.MeanCombineFn()) # average value per window pane
-                    | 'TargetAvg' >> ExtractAndAverageTarget(target)
-                    #| 'TargetFilter' >> beam.Map(lambda elem: (target, elem[target]))
-                    #| 'TargetAvg' >> beam.CombinePerKey(beam.combiners.MeanCombineFn())
+    def filterTarget(element, target):
+      logging.info(" Element: {}\n Target: {}".format(element[0],target))
+      logging.info("Equal? {}".format(element[0]==target))
+
+
+      return element  
+    output = (pane  | 'TargetAvg' >> ExtractAndAverageTarget(target,optimized)
+                    #| beam.CombinePerKey(beam.combiners.MeanCombineFn())
+                    #| beam.Filter(lambda x: x[0]==target)
                     | 'FormatOutput' >> beam.ParDo(FormatOutputFn()))
 
     if runner == 'Direct':
@@ -236,64 +244,54 @@ class ParseDataFn(beam.DoFn):
   def __init__(self): 
     self.num_parse_errors = Metrics.counter(self.__class__, 'num_parse_errors')
 
-    # dictionary key data structure
-    self.keys = ["DP2_WholeHouse_Power_Val", 
-        "DP2_WholeHouse_VAR_Val", "DP2_Condenser_Power_Val", 
-        "DP2_Condenser_VAR_Val", "DP2_AirHandler_Power_Val", 
-        "DP2_AirHandler_VAR_Val", "DP2_WaterHeater_Power_Val", 
-        "DP2_Dryer_Power_Val", "DP2_Range_Power_Val", 
-        "DP2_Refrigerator_Power_Val", "DP2_Washer_Power_Val", 
-        "DP2_Dishwasher_Power_Val", "DP2_Lights_Power_Val", 
-        "DP2_NRecept_Power_Val", "DP2_CounterRecpt_Power_Val", 
-        "DP2_WDRecpt_Power_Val", "Timestamp"]
-
   # main process
   def process(self,element):
-    # assume CSV as data input format
+    element.encode('utf-8')
+    elements = element.split(',')
+    # assume CSV as data input format    
+    key = elements[0]
     try:
-      #elements = list(csv.reader([element]))[0]
-      elements = element.split(',')
-      values = [float(i) for i in elements[1:-1:2]] #remove unit and test columns
-      values.append(elements[0]) # add timestamp to the end
-      logging.info('Parsed values: \'%s\'', values)
-      # Optimization 1: "merge"      
-      yield dict(zip(self.keys,values)) # save as dictionary
-      #yield zip(self.keys,values) # list of tuples((a,1),(b,2),(c,3))
-
+      value = float(elements[1])
     except:
+      value = 0
       self.num_parse_errors.inc()
-      logging.error('Parse error on \'%s\'', element)
+
+      logging.critical("ParseDataFn(): value parse error for \'{}\'".format(key))
+    try:
+      unix_ts = float(elements[2]) #element.pop('Timestamp',None) 
+    except:
+      unix_ts = 0
+      self.num_parse_errors.inc()
+      logging.critical("ParseDataFn(): timestamp parse error for \'{}\'".format(key))
+     
+    logging.debug("ParseDataFn(): ({},{},{})".format(key,value,unix_ts))
+
+    # new_element = dict((key,value))
+      #yield zip(self.keys,values) # list of tuples((a,1),(b,2),(c,3))
+    yield [key,value,unix_ts]
     
-class ParseTimestampFn(beam.DoFn):
-  def process(self, element):
-    from datetime import datetime 
-
-    logging.info('ConvertTimestampFn(): Timestamp {}\n'.format(element["Timestamp"]))
-    dt_obj = datetime.strptime(element["Timestamp"], TIME_FORMAT) 
-    unix_ts = time.mktime(dt_obj.timetuple())
-    element["Timestamp"] = float(unix_ts)
-    yield element
-
 # ParDo Transform: adds timestamp to element
 # Ref: Beam Programming Guide
 class AddTimestampFn(beam.DoFn):
   def process(self, element):
     # pop the timestamp off the dictionary (NOTE: this removes it from element)
-    logging.info('AddTimestampFn(): {}\n'.format(element))    
-    unix_ts = element.pop('Timestamp',None) 
-    logging.info('AddTimestampFn(): {} -> {}\n'.format(unix_ts,element))  
-    yield beam.window.TimestampedValue(element, unix_ts)
+    # PCollecton format: [key,value,unix_ts]
+    key_value = (element[0],element[1])
+    unix_ts = element[2]
+    logging.debug('AddTimestampFn(): {} {}\n'.format(unix_ts,key_value)) 
+      
+    yield beam.window.TimestampedValue(key_value,unix_ts)
 
-# Transform: format the output as 'IP : size'
+# Transform: format the output
 class FormatOutputFn(beam.DoFn):
   def process(self,rawOutput,window=beam.DoFn.WindowParam):
     # define output format
     
-    start = window.start.to_utc_datetime().strftime(TIME_FORMAT)
-    end = window.end.to_utc_datetime().strftime(TIME_FORMAT)
+    start = 0#window.start.to_utc_datetime().strftime(TIME_FORMAT)
+    end = 1#window.end.to_utc_datetime().strftime(TIME_FORMAT)
     # Format as CSV: "AVG(target),average_power,start of period,end of period"
-    formatApply = "AVG({:s}), {:f}, {:s}, {:s}"
-    formattedOutput = formatApply.format(rawOutput[0],rawOutput[1],start,end)# Transform: format the output as 'IP : size'
+    formatApply = "AVG({}), {}, {}, {}"
+    formattedOutput = formatApply.format(rawOutput[0],rawOutput[1],start,end)
    
     logging.info('FormatOutputFn() {}\n'.format(formattedOutput))
     return [formattedOutput]
